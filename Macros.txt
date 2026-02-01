@@ -1,0 +1,970 @@
+Sub FillVetDataFromCSV_Complete()
+    Dim ws As Worksheet
+    Dim fd As FileDialog
+    Dim csvPath As String
+    Dim tempWb As Workbook, tempWs As Worksheet
+    Dim lastRow As Long, lastCol As Long
+    Dim dictAbbr As Object, dictRefCat As Object, dictRefDog As Object
+    Dim i As Long, j As Long, outputRow As Long, startCol As Long
+    Dim petType As String, paramCode As String, paramName As String
+    Dim testType As String
+    
+    ' Проверяем, есть ли активный лист
+    On Error Resume Next
+    Set ws = ActiveSheet
+    On Error GoTo 0
+    
+    If ws Is Nothing Then
+        MsgBox "Нет активного листа!", vbExclamation
+        Exit Sub
+    End If
+    
+    ' Спрашиваем подтверждение
+    If MsgBox("Заполнить данный шаблон данными из CSV файла?", vbYesNo + vbQuestion, "Загрузка данных") = vbNo Then
+        Exit Sub
+    End If
+    
+    Application.ScreenUpdating = False
+    
+    ' ===== 1. СОЗДАЕМ СЛОВАРИ =====
+    Set dictAbbr = CreateObject("Scripting.Dictionary")
+    Set dictRefCat = CreateObject("Scripting.Dictionary")
+    Set dictRefDog = CreateObject("Scripting.Dictionary")
+    
+    FillAllAbbreviations dictAbbr
+    FillCatReferences dictRefCat
+    FillDogReferences dictRefDog
+    
+    ' ===== 2. ВЫБИРАЕМ CSV ФАЙЛ =====
+    Set fd = Application.FileDialog(msoFileDialogFilePicker)
+    With fd
+        .Title = "Выберите CSV файл с анализами"
+        .Filters.Clear
+        .Filters.Add "CSV файлы", "*.csv"
+        .AllowMultiSelect = False
+        
+        If .Show = -1 Then
+            csvPath = .SelectedItems(1)
+        Else
+            MsgBox "Операция отменена", vbInformation
+            Exit Sub
+        End If
+    End With
+    
+    ' ===== 3. ЗАГРУЖАЕМ CSV С ПРАВИЛЬНЫМИ НАСТРОЙКАМИ =====
+    ' Создаем новую книгу и загружаем через Text Import Wizard
+    Set tempWb = Workbooks.Add
+    Set tempWs = tempWb.Worksheets(1)
+    
+    ' Используем QueryTable для правильной загрузки
+    With tempWs.QueryTables.Add( _
+        Connection:="TEXT;" & csvPath, _
+        Destination:=tempWs.Range("A1"))
+        .Name = "CSV_Import"
+        .FieldNames = True
+        .RowNumbers = False
+        .FillAdjacentFormulas = False
+        .PreserveFormatting = True
+        .RefreshOnFileOpen = False
+        .RefreshStyle = xlOverwriteCells
+        .SavePassword = False
+        .SaveData = True
+        .AdjustColumnWidth = True
+        .RefreshPeriod = 0
+        .TextFilePromptOnRefresh = False
+        .TextFilePlatform = 65001 ' UTF-8
+        .TextFileStartRow = 1
+        .TextFileParseType = xlDelimited
+        .TextFileTextQualifier = xlTextQualifierDoubleQuote
+        .TextFileConsecutiveDelimiter = False
+        .TextFileTabDelimiter = False
+        .TextFileSemicolonDelimiter = False
+        .TextFileCommaDelimiter = True ' Запятая как разделитель
+        .TextFileSpaceDelimiter = False
+        .TextFileColumnDataTypes = Array(1) ' Все как текст
+        .TextFileTrailingMinusNumbers = True
+        .Refresh BackgroundQuery:=False
+    End With
+    
+    ' Удаляем QueryTable
+    tempWs.QueryTables(1).Delete
+    
+    ' ===== 4. ПОЛУЧАЕМ РАЗМЕРЫ ДАННЫХ =====
+    lastRow = tempWs.Cells(tempWs.Rows.Count, 1).End(xlUp).Row
+    lastCol = tempWs.Cells(1, tempWs.Columns.Count).End(xlToLeft).Column
+    
+    Debug.Print "CSV загружен: " & lastRow & " строк, " & lastCol & " колонок"
+    
+    ' ДЕБАГ: первые несколько колонок
+    Debug.Print "=== ЗАГОЛОВКИ ==="
+    For j = 1 To Application.Min(10, lastCol)
+        Debug.Print j & ": '" & tempWs.Cells(1, j).value & "'"
+    Next j
+    
+    If lastRow < 2 Then
+        tempWb.Close False
+        MsgBox "В файле нет данных!", vbExclamation
+        Exit Sub
+    End If
+    
+    ' ===== 5. ОПРЕДЕЛЯЕМ СТАРТОВУЮ КОЛОНКУ =====
+    ' Ищем колонку с WBC или другими параметрами
+    startCol = 0
+    
+    For j = 1 To lastCol
+        If Not IsEmpty(tempWs.Cells(1, j)) Then
+            Dim header As String
+            header = CStr(tempWs.Cells(1, j).value)
+            header = Trim(header)
+            
+            ' Проверяем разные варианты заголовков
+            If header = "WBC" Or header = "RBC" Or header = "HGB" Or _
+               header = "NEU#" Or header = "LYM#" Or header = "MON#" Or _
+               header = "EOS#" Or header = "BAS#" Or _
+               header = "Иммунофлуоресцентное тестирование" Then
+                startCol = j
+                Debug.Print "Нашли стартовую колонку " & startCol & " по параметру: '" & header & "'"
+                Exit For
+            End If
+        End If
+    Next j
+    
+    ' Если не нашли, используем эвристику
+    If startCol = 0 Then
+        ' Ищем колонку после времени (обычно это 6-я или 7-я)
+        For j = 1 To lastCol
+            If Not IsEmpty(tempWs.Cells(1, j)) Then
+                header = CStr(tempWs.Cells(1, j).value)
+                If header = "Время" Then
+                    startCol = j + 1
+                    Debug.Print "Нашли 'Время' в колонке " & j & ", начинаем с " & startCol
+                    Exit For
+                End If
+            End If
+        Next j
+        
+        ' Если все еще не нашли, начинаем с 6-й колонки
+        If startCol = 0 Then
+            If lastCol >= 6 Then
+                startCol = 6
+            Else
+                startCol = 1
+            End If
+            Debug.Print "Используем колонку по умолчанию: " & startCol
+        End If
+    End If
+    
+    ' Проверяем границы
+    If startCol > lastCol Then
+        Debug.Print "ОШИБКА: startCol > lastCol (" & startCol & " > " & lastCol & ")"
+        tempWb.Close False
+        MsgBox "Ошибка определения начала данных!", vbExclamation
+        Exit Sub
+    End If
+    
+    ' ===== 6. ЗАПОЛНЯЕМ ШАБЛОН =====
+    ' Очищаем старые данные
+    ws.Range("A4:C" & ws.Rows.Count).ClearContents
+    
+    ' Заполняем заголовочные данные
+    ws.Cells(1, 1).value = "Кличка:"
+    ws.Cells(2, 1).value = tempWs.Cells(2, 3).value
+    
+    ws.Cells(1, 2).value = "Вид питомца:"
+    ws.Cells(2, 2).value = tempWs.Cells(2, 4).value
+    petType = tempWs.Cells(2, 4).value
+    
+    ws.Cells(1, 3).value = "Время анализа:"
+    ws.Cells(2, 3).value = tempWs.Cells(2, 5).value
+    
+    ' Форматируем заголовок
+    With ws.Range("A1:C2")
+        .HorizontalAlignment = xlLeft
+        .VerticalAlignment = xlCenter
+    End With
+    
+    
+    ' ===== 7. СОЗДАЕМ ТАБЛИЦУ РЕЗУЛЬТАТОВ =====
+    outputRow = 4
+    
+    ' Заголовки таблицы
+    ws.Cells(outputRow, 1).value = "Показатель"
+    ws.Cells(outputRow, 2).value = "Значение"
+    ws.Cells(outputRow, 3).value = "Референсные значения"
+    
+    ' Форматируем заголовки таблицы
+    With ws.Range("A" & outputRow & ":C" & outputRow)
+        .Font.Bold = True
+        .Font.Color = RGB(255, 255, 255)
+        '.Interior.Color = RGB(128, 0, 128)
+        .HorizontalAlignment = xlLeft
+        
+        ' ГРАНИЦЫ  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+        
+       ' .Borders.LineStyle = xlContinuous
+       
+       ' !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+       
+       
+    End With
+    
+    outputRow = outputRow + 1
+    
+    ' ===== 8. ПЕРЕНОСИМ ДАННЫЕ В ТАБЛИЦУ =====
+    Dim recordCount As Long
+    recordCount = 0
+    
+    Debug.Print "=== ПЕРЕНОС ДАННЫХ ==="
+    Debug.Print "Начинаем с колонки: " & startCol
+    Debug.Print "Всего колонок: " & lastCol
+    
+ For j = startCol To lastCol
+        If Not IsEmpty(tempWs.Cells(1, j)) Then
+            paramCode = CStr(tempWs.Cells(1, j).value)
+            paramCode = CleanText(paramCode)
+            paramCode = Replace(Replace(paramCode, "v", ""), "^", "")
+            paramCode = Trim(paramCode)
+            
+            Debug.Print "Колонка " & j & ": код='" & paramCode & "'"
+            
+            If dictAbbr.Exists(paramCode) Then
+                paramName = dictAbbr(paramCode)
+            Else
+                paramName = paramCode
+            End If
+            
+            ' vvv ВСТАВИТЬ ЗДЕСЬ vvv
+            ' Определяем тип исследования по первому параметру
+            If testType = "" Then
+                testType = GetTestType(paramName)
+                Debug.Print "Определен тип исследования: " & testType
+            End If
+            ' ^^^ ВСТАВИТЬ ЗДЕСЬ ^^^
+            
+            ' Обрабатываем данные
+For i = 2 To lastRow
+                If Not IsEmpty(tempWs.Cells(i, j)) Then
+                    Dim valueStr As String
+                    valueStr = CStr(tempWs.Cells(i, j).value)
+                    valueStr = Trim(valueStr)
+                    
+                    If valueStr <> "" And valueStr <> "--" Then
+                        ' Записываем в таблицу
+                        ws.Cells(outputRow, 1).value = paramName
+                        
+                        ' ЗАПИСЫВАЕМ КАК ТЕКСТ С АПОСТРОФОМ
+                        ws.Cells(outputRow, 2).value = "'" & valueStr  ' < Апостроф для ВСЕХ значений
+                        
+                        ' Добавляем референс
+                        Dim refValue As String
+                        refValue = GetReferenceValue(paramName, petType, dictRefCat, dictRefDog)
+                        ws.Cells(outputRow, 3).value = "'" & refValue  ' < Апостроф для ВСЕХ референсов
+                        
+                        outputRow = outputRow + 1
+                        recordCount = recordCount + 1
+                    End If
+                End If
+            Next i
+        End If
+    Next j
+    
+    Debug.Print "Перенесено записей: " & recordCount
+    
+    ' Закрываем временную книгу
+    tempWb.Close False
+    
+    ' ===== 9. ОБРАБАТЫВАЕМ ДАННЫЕ =====
+    If recordCount > 0 Then
+        ProcessAndCompareAllData ws, outputRow - 1
+        Debug.Print "Данные обработаны и сравнены"
+    Else
+        Debug.Print "НЕТ ДАННЫХ!"
+        MsgBox "Не удалось загрузить данные. CSV файл может быть в неправильном формате.", vbExclamation
+        Application.ScreenUpdating = True
+        Exit Sub
+    End If
+    
+
+    If testType <> "" Then
+        ws.PageSetup.CenterHeader = "ОТЧЁТ ОБ АНАЛИЗЕ " & UCase(testType)
+        Debug.Print "Добавлен заголовок: " & testType
+    End If
+    
+    
+    
+    ' ===== 10. ФОРМАТИРУЕМ ТАБЛИЦУ =====
+    With ws
+        ' Ширины колонок
+        .Columns("A:A").ColumnWidth = 35
+        .Columns("B:B").ColumnWidth = 18
+        .Columns("C:C").ColumnWidth = 25
+        
+        ' Границы
+If outputRow > 5 Then
+    With .Range("A4:C" & outputRow - 1)
+        ' Тонкие светло-серые границы
+        .Borders.LineStyle = xlContinuous
+        .Borders.Weight = xlThin
+        .Borders.Color = RGB(200, 200, 200) ' Светло-серый
+        
+        .HorizontalAlignment = xlLeft
+        .VerticalAlignment = xlCenter
+    End With
+            
+
+            
+            ' Автоподбор
+            .Range("A5:C" & outputRow - 1).Rows.AutoFit
+        End If
+        
+        .Rows("4:4").AutoFit
+    End With
+    
+    If outputRow > 5 Then
+        ws.Range("B5:C" & outputRow - 1).Replace What:=".", Replacement:=",", LookAt:=xlPart
+    End If
+    
+    Application.ScreenUpdating = True
+    
+    ' ===== 11. СООБЩЕНИЕ =====
+    MsgBox "Готово!" & vbCrLf & _
+           "Кличка: " & ws.Cells(2, 1).value & vbCrLf & _
+           "Вид: " & petType & vbCrLf & _
+           "Записей: " & recordCount, vbInformation
+    
+    ws.Activate
+    ws.Range("A4").Select
+End Sub
+
+Function GetTestType(paramName As String) As String
+    ' Определяет тип исследования по названию параметра
+    ' Возвращает: "крови", "мочи" или "кала"
+    
+    Dim paramLower As String
+    paramLower = LCase(paramName)
+    
+    ' Проверяем мочу
+    If InStr(paramLower, "цилиндр") > 0 Or _
+       InStr(paramLower, "кристалл") > 0 Or _
+       InStr(paramLower, "(моча)") > 0 Then
+        GetTestType = "мочи"
+        
+    ' Проверяем кал
+    ElseIf InStr(paramLower, "бактери") > 0 Or _
+           InStr(paramLower, "паразит") > 0 Or _
+           InStr(paramLower, "яйца") > 0 Or _
+           InStr(paramLower, "кокцидий") > 0 Then
+        GetTestType = "кала"
+        
+    ' По умолчанию - кровь
+    Else
+        GetTestType = "крови"
+    End If
+End Function
+
+Function CreateReportHeader(testType As String) As String
+    ' Создает заголовок отчета
+    CreateReportHeader = "ОТЧЁТ ОБ АНАЛИЗЕ " & UCase(testType)
+End Function
+
+
+Sub FixValueCellFormat(cell As Range)
+    ' Исправляем формат значения - ОСТАВЛЯЕМ ТОЧКИ
+    If IsEmpty(cell) Then Exit Sub
+    
+    Dim val As String
+    val = CStr(cell.value)
+    
+    ' 1. Исправляем степени (это нужно!)
+    val = Replace(val, " 109/L", " 10^9/L")
+    val = Replace(val, " 1012/L", " 10^12/L")
+    val = Replace(val, " 106/L", " 10^6/L")
+    val = Replace(val, " 103/L", " 10^3/L")
+    val = Replace(val, "109/L", "10^9/L")
+    val = Replace(val, "1012/L", "10^12/L")
+    val = Replace(val, "106/L", "10^6/L")
+    val = Replace(val, "103/L", "10^3/L")
+    
+    ' 2. Убираем лишние пробелы
+    While InStr(val, "  ") > 0
+        val = Replace(val, "  ", " ")
+    Wend
+    val = Trim(val)
+    
+    ' 3. Отделяем проценты пробелом
+    val = Replace(val, "%", " %")
+    
+    cell.value = val
+End Sub
+
+
+Sub ProcessAndCompareAllData(ws As Worksheet, lastRow As Long)
+    If lastRow < 5 Then Exit Sub
+    
+   ws.Range("B5:B" & lastRow).NumberFormat = "@"
+    ws.Range("C5:C" & lastRow).NumberFormat = "@"
+    
+    Dim i As Long
+    Dim valueCell As Range, refCell As Range
+    
+    For i = 5 To lastRow
+        Set valueCell = ws.Cells(i, 2) ' Значение
+        Set refCell = ws.Cells(i, 3)   ' Референс
+        
+        ' 1. Исправляем формат значения (для отображения)
+        FixValueCellFormat valueCell
+        
+        ' 3. Сравниваем и раскрашиваем (используем новую функцию с точками)
+        If Not IsEmpty(valueCell) And Not IsEmpty(refCell) Then
+            CompareAndColorCellsWithDots valueCell, refCell
+        End If
+    Next i
+End Sub
+
+Function WriteAsText(cell As Range, value As String)
+    ' Записывает значение как текст, предотвращая автоформатирование
+    
+    With cell
+        .Clear
+        .NumberFormat = "@"          ' Формат "Текст"
+        .value = value               ' Записываем значение
+        .NumberFormat = "General"    ' Возвращаем общий формат (опционально)
+    End With
+End Function
+
+
+Sub CompareAndColorCellsWithDots(valueCell As Range, refCell As Range)
+    ' Сравнивает значения где используются точки как десятичные разделители
+    If IsEmpty(valueCell) Or IsEmpty(refCell) Then Exit Sub
+    
+    Dim valueNum As Double
+    Dim refMin As Double, refMax As Double
+    
+    ' Извлекаем число из значения (обрабатываем точки)
+    valueNum = ExtractNumberFromFormattedText(valueCell.value)
+    
+    ' Извлекаем диапазон из референса
+    If ExtractRefRangeFromText(refCell.value, refMin, refMax) Then
+        ' Сравниваем
+        If valueNum < refMin Then
+            valueCell.Font.Color = RGB(0, 112, 192) ' Голубой (низкий)
+        ElseIf valueNum > refMax Then
+            valueCell.Font.Color = RGB(255, 0, 0)   ' Красный (высокий)
+        Else
+            valueCell.Font.Color = RGB(0, 0, 0)     ' Черный (норма)
+        End If
+    End If
+End Sub
+
+Function ExtractNumberFromFormattedText(text As String) As Double
+    ' Извлекает число из отформатированного текста "176.64  g/L"
+    On Error Resume Next
+    
+    text = Trim(text)
+    If text = "" Then
+        ExtractNumberFromFormattedText = 0
+        Exit Function
+    End If
+    
+    ' Ищем первый пробел или нецифровой символ после числа
+    Dim numPart As String
+    Dim i As Long
+    numPart = ""
+    
+    For i = 1 To Len(text)
+        Dim ch As String
+        ch = Mid(text, i, 1)
+        
+        ' Если это цифра, точка, минус или запятая - добавляем
+        If IsNumeric(ch) Or ch = "." Or ch = "-" Or ch = "," Then
+            numPart = numPart & ch
+        ElseIf numPart <> "" Then
+            ' Если уже собрали число и встретили нечисловой символ - выходим
+            Exit For
+        End If
+    Next i
+    
+    ' Конвертируем в число
+    If numPart <> "" Then
+        ' Заменяем точку на запятую для Excel
+        numPart = Replace(numPart, ".", ",")
+        ExtractNumberFromFormattedText = CDbl(numPart)
+    Else
+        ExtractNumberFromFormattedText = 0
+    End If
+End Function
+
+Function ExtractRefRangeFromText(refText As String, ByRef minVal As Double, ByRef maxVal As Double) As Boolean
+    ' Извлекает диапазон из референса "131-205"
+    On Error Resume Next
+    
+    refText = Trim(refText)
+    If refText = "" Or refText = "Нет данных" Then
+        ExtractRefRangeFromText = False
+        Exit Function
+    End If
+    
+    Dim dashPos As Long
+    dashPos = InStr(refText, "-")
+    
+    If dashPos > 0 Then
+        Dim minStr As String, maxStr As String
+        minStr = Trim(Left(refText, dashPos - 1))
+        maxStr = Trim(Mid(refText, dashPos + 1))
+        
+        ' Конвертируем с учетом точек
+        minVal = ConvertToDouble(minStr)
+        maxVal = ConvertToDouble(maxStr)
+        
+        ExtractRefRangeFromText = True
+    Else
+        ExtractRefRangeFromText = False
+    End If
+End Function
+
+Function ConvertToDouble(text As String) As Double
+    ' Универсальная конвертация строки в Double
+    On Error Resume Next
+    
+    text = Trim(text)
+    If text = "" Then
+        ConvertToDouble = 0
+        Exit Function
+    End If
+    
+    ' Пробуем разные варианты
+    text = Replace(text, ".", ",")  ' Сначала точки в запятые
+    ConvertToDouble = CDbl(text)
+    
+    If Err.Number <> 0 Then
+        Err.Clear
+        ' Пробуем наоборот
+        text = Replace(text, ",", ".")
+        ConvertToDouble = CDbl(text)
+    End If
+End Function
+
+
+Function GetNumberFromValue(text As String) As Double
+    ' Надежное извлечение числа из строки
+    On Error GoTo ErrHandler
+    
+    text = Trim(text)
+    If text = "" Then Exit Function
+    
+    ' Ищем пробел (разделитель числа и единиц измерения)
+    Dim spacePos As Long
+    spacePos = InStr(text, " ")
+    
+    Dim numStr As String
+    If spacePos > 0 Then
+        ' Берем часть до пробела
+        numStr = Left(text, spacePos - 1)
+    Else
+        ' Берем всю строку
+        numStr = text
+    End If
+    
+    ' Пробуем преобразовать с помощью CDbl
+    GetNumberFromValue = CDbl(numStr)
+    
+    Exit Function
+    
+ErrHandler:
+    ' Если CDbl не сработал, пробуем через Val
+    GetNumberFromValue = val(numStr)
+End Function
+
+
+
+Function IsNumericCustom(text As String) As Boolean
+    ' Кастомная проверка на число - РАБОТАЕТ С ЗАПЯТЫМИ
+    On Error GoTo NotNumeric
+    
+    ' Заменяем запятую на точку для проверки
+    text = Replace(text, ",", ".")
+    
+    Dim dbl As Double
+    dbl = CDbl(text)
+    IsNumericCustom = True
+    Exit Function
+    
+NotNumeric:
+    IsNumericCustom = False
+End Function
+
+
+
+' ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
+Function CleanText(text As String) As String
+    CleanText = Replace(Replace(Trim(text), """", ""), "'", "")
+End Function
+
+Function GetReferenceValue(paramName As String, petType As String, _
+                           dictCat As Object, dictDog As Object) As String
+    If InStr(1, petType, "Кошка", vbTextCompare) > 0 Then
+        If dictCat.Exists(paramName) Then
+            GetReferenceValue = dictCat(paramName)
+        Else
+            GetReferenceValue = "Нет данных"
+        End If
+    ElseIf InStr(1, petType, "Собака", vbTextCompare) > 0 Then
+        If dictDog.Exists(paramName) Then
+            GetReferenceValue = dictDog(paramName)
+        Else
+            GetReferenceValue = "Нет данных"
+        End If
+    Else
+        GetReferenceValue = "Неизвестный вид"
+    End If
+End Function
+
+' ===== ПОЛНЫЙ СЛОВАРЬ АББРЕВИАТУР (94 шт) =====
+Sub FillAllAbbreviations(dict As Object)
+    ' Гематология - Лейкоциты
+    dict("WBC") = "Лейкоциты"
+    dict("NEU#") = "Нейтрофилы"
+    dict("NST#") = "Палочкоядерные нейтрофилы"
+    dict("NSG#") = "Сегментоядерные нейтрофилы"
+    dict("NSH#") = "Гиперсегментированные нейтрофилы"
+    dict("LYM#") = "Лимфоциты"
+    dict("MON#") = "Моноциты"
+    dict("EOS#") = "Эозинофилы"
+    dict("BAS#") = "Базофилы"
+    dict("NEU%") = "Нейтрофилы %"
+    dict("NST/WBC%") = "Палочкоядерные/лейкоциты %"
+    dict("NST/NEU%") = "Палочкоядерные/нейтрофилы %"
+    dict("NSG%") = "Сегментоядерные %"
+    dict("NSH/WBC%") = "Гиперсегментированные/лейкоциты %"
+    dict("NSH/NEU%") = "Гиперсегментированные/нейтрофилы %"
+    dict("LYM%") = "Лимфоциты %"
+    dict("MON%") = "Моноциты %"
+    dict("EOS%") = "Эозинофилы %"
+    dict("BAS%") = "Базофилы %"
+    
+    ' Гематология - Эритроциты
+    dict("RBC") = "Эритроциты"
+    dict("HGB") = "Гемоглобин"
+    dict("HCT") = "Гематокрит"
+    dict("MCV") = "Средний объем эритроцита"
+    dict("MCH") = "Среднее содержание гемоглобина"
+    dict("MCHC") = "Средняя концентрация гемоглобина"
+    dict("RDW-CV") = "Распределение эритроцитов (CV)"
+    dict("RDW-SD") = "Распределение эритроцитов (SD)"
+    dict("HDW-CV") = "Распределение гемоглобина (CV)"
+    dict("HDW-SD") = "Распределение гемоглобина (SD)"
+    
+    ' Ретикулоциты
+    dict("RET#") = "Ретикулоциты"
+    dict("RET%") = "Ретикулоциты %"
+    dict("ETG#") = "ЭТГ#"
+    dict("ETG%") = "ЭТГ %"
+    dict("SPH#") = "Сфероциты"
+    dict("SPH%") = "Сфероциты %"
+    
+    ' Тромбоциты
+    dict("PLT") = "Тромбоциты"
+    dict("MPV") = "Средний объем тромбоцитов"
+    dict("PDW") = "Ширина распределения тромбоцитов"
+    dict("PCT") = "Тромбокрит"
+    dict("APLT#") = "Агрегированные тромбоциты"
+    dict("P-LCC") = "Количество крупных тромбоцитов"
+    dict("P-LCR") = "Процент крупных тромбоцитов"
+    
+    ' Моча - Цилиндры
+    dict("HYA#") = "Гиалиновые цилиндры"
+    dict("RBC-C#") = "Эритроцитарные цилиндры"
+    dict("LC#") = "Лейкоцитарные цилиндры"
+    dict("RTC#") = "Цилиндры из клеток канальцев"
+    dict("GRA#") = "Зернистые цилиндры"
+    dict("WAC#") = "Восковидные цилиндры"
+    dict("FC#") = "Жировые цилиндры"
+    dict("BC#") = "Гемоглобиновые цилиндры"
+    
+    ' Моча - Кристаллы
+    dict("MAP#") = "Кристаллы струвита"
+    dict("COMC#") = "Кристаллы оксалата кальция (моногидрат)"
+    dict("COD#") = "Кристаллы оксалата кальция (дигидрат)"
+    dict("CP#") = "Кристаллы фосфата кальция"
+    dict("UAC#") = "Кристаллы мочевой кислоты"
+    dict("CYSC#") = "Кристаллы цистина"
+    dict("CC#") = "Кристаллы холестерина"
+    dict("BilC#") = "Кристаллы билирубина"
+    dict("AUC#") = "Кристаллы аммоний биурата"
+    
+    ' Моча - Клетки и элементы
+    dict("RBC#") = "Эритроциты (моча)"
+    dict("WBC#") = "Лейкоциты (моча)"
+    dict("RTE#") = "Клетки канальцев почек"
+    dict("SEC#") = "Плоские эпителиальные клетки"
+    dict("TEC#") = "Клетки переходного эпителия"
+    dict("SPE#") = "Сперматозоиды"
+    dict("FAT#") = "Жировые капли"
+    dict("PHL#") = "Слизистые нити"
+    
+    ' Паразиты
+    dict("ALE#") = "Яйца аскарид"
+    dict("ANE#") = "Яйца анкилостомы"
+    dict("CEE#") = "Яйца цестод"
+    dict("DIP#") = "Яйца дипилидия"
+    dict("SPI#") = "Яйца спирометры"
+    dict("TtE#") = "Яйца цепня (тип Taenia)"
+    dict("TRE#") = "Яйца трематод"
+    dict("TRI#") = "Трихомонады"
+    dict("FLA#") = "Лямблии"
+    
+    ' Кокцидии
+    dict("COD0#") = "Вариант кокцидий 0"
+    dict("COD1#") = "Вариант кокцидий 1"
+    dict("COD2#") = "Вариант кокцидий 2"
+    dict("COD#") = "Кокцидии"
+    dict("Tg#") = "Токсоплазма"
+    
+    ' Кал - Бактерии
+    dict("COS#") = "Кокковые бактерии"
+    dict("BACI#") = "Бациллы"
+    dict("C/B#") = "Соотношение кокков и бацилл"
+    dict("C/B") = "Соотношение кокков и бацилл"
+    dict("CAM#") = "Кампилобактер"
+    dict("BAC#") = "Палочковидные бактерии"
+    dict("SAC#") = "Дрожжи"
+    dict("SS1#") = "Брахиспира"
+    dict("SS2#") = "Хеликобактер"
+    dict("YEA#") = "Дрожжи"
+    dict("FUN#") = "Грибные нити"
+    
+    ' Кал - Клетки и элементы
+    dict("EPC#") = "Эпителиальные клетки"
+    dict("STA#") = "Крахмальные зёрна"
+    dict("LFAT#") = "Жировые капли"
+    dict("PLA#") = "Растительные волокна"
+    dict("AF#") = "Мышечные волокна"
+    
+    ' Биохимические маркеры
+    dict("cCRP") = "С-реактивный белок у собак"
+    dict("fsAA") = "Сывороточный амилоид A у кошек"
+End Sub
+
+' ===== РЕФЕРЕНСЫ ДЛЯ КОШЕК =====
+Sub FillCatReferences(dict As Object)
+    ' Гематология
+    dict("Лейкоциты") = "2.87-17.02"
+    dict("Нейтрофилы") = "2.3-10.29"
+    dict("Палочкоядерные нейтрофилы") = "0-0.8"
+    dict("Сегментоядерные нейтрофилы") = "2.3-12.5"
+    dict("Гиперсегментированные нейтрофилы") = "0-0.3"
+    dict("Лимфоциты") = "0.92-6.88"
+    dict("Моноциты") = "0.05-0.67"
+    dict("Эозинофилы") = "0.17-1.57"
+    dict("Базофилы") = "0-0.26"
+    dict("Нейтрофилы %") = "38-80"
+    dict("Палочкоядерные/лейкоциты %") = "0-10"
+    dict("Палочкоядерные/нейтрофилы %") = "0-15"
+    dict("Сегментоядерные %") = "35-75"
+    dict("Гиперсегментированные/лейкоциты %") = "0-3"
+    dict("Гиперсегментированные/нейтрофилы %") = "0-4"
+    dict("Лимфоциты %") = "16-47.5"
+    dict("Моноциты %") = "1-7.6"
+    dict("Эозинофилы %") = "1-11.1"
+    dict("Базофилы %") = "0-0.7"
+    dict("Эритроциты") = "6.54-12.2"
+    dict("Гемоглобин") = "98-162"
+    dict("Гематокрит") = "30.3-52.3"
+    dict("Средний объем эритроцита") = "35.9-53.1"
+    dict("Среднее содержание гемоглобина") = "11.8-17.3"
+    dict("Средняя концентрация гемоглобина") = "281-358"
+    dict("Распределение эритроцитов (CV)") = "20.9-33.6"
+    dict("Распределение эритроцитов (SD)") = "16-27.4"
+    dict("Распределение гемоглобина (CV)") = "7.0-30.0"
+    dict("Распределение гемоглобина (SD)") = "2.0-8.0"
+    dict("Ретикулоциты") = "3.0-50.0"
+    dict("Ретикулоциты %") = "0.0-1.0"
+    dict("ЭТГ#") = "0.0-0.06"
+    dict("ЭТГ %") = "0.0-2.5"
+    dict("Сфероциты") = "0.0-193.66"
+    dict("Сфероциты %") = "0-2.71"
+    dict("Тромбоциты") = "151-600"
+    dict("Средний объем тромбоцитов") = "11.4-21.6"
+    dict("Ширина распределения тромбоцитов") = "9.1-19.4"
+    dict("Тромбокрит") = "1.7-8.6"
+    dict("Агрегированные тромбоциты") = "0-0.15"
+    dict("Количество крупных тромбоцитов") = "0-103"
+    dict("Процент крупных тромбоцитов") = "0-30"
+    
+    ' Моча
+    dict("Гиалиновые цилиндры") = "0.00-1.00"
+    dict("Эритроцитарные цилиндры") = "0-0"
+    dict("Лейкоцитарные цилиндры") = "0-0"
+    dict("Цилиндры из клеток канальцев") = "0-0"
+    dict("Зернистые цилиндры") = "0-0"
+    dict("Восковидные цилиндры") = "0-0"
+    dict("Жировые цилиндры") = "0-0"
+    dict("Гемоглобиновые цилиндры") = "0-0"
+    dict("Кристаллы струвита") = "0.00-0.30"
+    dict("Кристаллы оксалата кальция (моногидрат)") = "0-0"
+    dict("Кристаллы оксалата кальция (дигидрат)") = "0.00-0.30"
+    dict("Кристаллы фосфата кальция") = "0-0"
+    dict("Кристаллы мочевой кислоты") = "0-0"
+    dict("Кристаллы цистина") = "0-0"
+    dict("Кристаллы холестерина") = "0-0"
+    dict("Кристаллы билирубина") = "0-0"
+    dict("Кристаллы аммоний биурата") = "0.00-0.30"
+    dict("Эритроциты (моча)") = "0.0-5.00"
+    dict("Лейкоциты (моча)") = "0.0-5.00"
+    dict("Клетки канальцев почек") = "0-0"
+    dict("Плоские эпителиальные клетки") = "0-2.00"
+    dict("Клетки переходного эпителия") = "0-2.00"
+    dict("Сперматозоиды") = "0-0"
+    dict("Жировые капли") = "0-5.00"
+    dict("Слизистые нити") = "0-1.00"
+    
+    ' Паразиты
+    dict("Яйца аскарид") = "0-0"
+    dict("Яйца анкилостомы") = "0-0"
+    dict("Яйца цестод") = "0-0"
+    dict("Яйца дипилидия") = "0-0"
+    dict("Яйца спирометры") = "0-0"
+    dict("Яйца цепня (тип Taenia)") = "0-0"
+    dict("Яйца трематод") = "0-0"
+    dict("Трихомонады") = "0-0"
+    dict("Лямблии") = "0-0"
+    dict("Вариант кокцидий 0") = "0"
+    dict("Вариант кокцидий 1") = "0"
+    dict("Вариант кокцидий 2") = "0"
+    dict("Кокцидии") = "0"
+    dict("Токсоплазма") = "0-0"
+    
+    ' Кал
+    dict("Кокковые бактерии") = "2.00-120.00"
+    dict("Бациллы") = "80.00-2200.00"
+    dict("Соотношение кокков и бацилл") = "0.01-0.15"
+    dict("Кампилобактер") = "0-4.5"
+    dict("Палочковидные бактерии") = "0-6.00"
+    dict("Дрожжи") = "0-20"
+    dict("Брахиспира") = "0"
+    dict("Хеликобактер") = "0"
+    dict("Грибные нити") = "0-0"
+    dict("Эпителиальные клетки") = "0-2"
+    dict("Крахмальные зёрна") = "0-2"
+    dict("Жировые капли") = "0-0.2"
+    dict("Растительные волокна") = "0-0.1"
+    dict("Мышечные волокна") = "0-0.1"
+    
+    ' Биохимия
+    dict("Сывороточный амилоид A у кошек") = "0"
+End Sub
+
+' ===== РЕФЕРЕНСЫ ДЛЯ СОБАК =====
+Sub FillDogReferences(dict As Object)
+    ' Гематология
+    dict("Лейкоциты") = "5.05-16.76"
+    dict("Нейтрофилы") = "2.95-11.64"
+    dict("Палочкоядерные нейтрофилы") = "0-0.80"
+    dict("Сегментоядерные нейтрофилы") = "2.50-11.30"
+    dict("Гиперсегментированные нейтрофилы") = "0-0.40"
+    dict("Лимфоциты") = "1.05-5.10"
+    dict("Моноциты") = "0.16-1.12"
+    dict("Эозинофилы") = "0.06-1.23"
+    dict("Базофилы") = "0-0.10"
+    dict("Нейтрофилы %") = "52-78"
+    dict("Палочкоядерные/лейкоциты %") = "0-10"
+    dict("Палочкоядерные/нейтрофилы %") = "0-20"
+    dict("Сегментоядерные %") = "50-75"
+    dict("Гиперсегментированные/лейкоциты %") = "0-5"
+    dict("Гиперсегментированные/нейтрофилы %") = "0-7"
+    dict("Лимфоциты %") = "16-41.5"
+    dict("Моноциты %") = "1.00-13.00"
+    dict("Эозинофилы %") = "0.5-11.85"
+    dict("Базофилы %") = "0-0.9"
+    dict("Эритроциты") = "5.65-8.87"
+    dict("Гемоглобин") = "131-205"
+    dict("Гематокрит") = "37.3-61.7"
+    dict("Средний объем эритроцита") = "61.6-73.5"
+    dict("Среднее содержание гемоглобина") = "21.2-25.9"
+    dict("Средняя концентрация гемоглобина") = "320-379"
+    dict("Распределение эритроцитов (CV)") = "11.2-17.1"
+    dict("Распределение эритроцитов (SD)") = "25.6-41.6"
+    dict("Распределение гемоглобина (CV)") = "7.0-20.0"
+    dict("Распределение гемоглобина (SD)") = "2.0-8.0"
+    dict("Ретикулоциты") = "3-110"
+    dict("Ретикулоциты %") = "0-1.5"
+    dict("ЭТГ#") = "0-0.05"
+    dict("ЭТГ %") = "0-1.65"
+    dict("Сфероциты") = "0-130.1"
+    dict("Сфероциты %") = "0-1.54"
+    dict("Тромбоциты") = "148-484"
+    dict("Средний объем тромбоцитов") = "8.7-13.2"
+    dict("Ширина распределения тромбоцитов") = "9.1-19.4"
+    dict("Тромбокрит") = "1.4-4.6"
+    dict("Агрегированные тромбоциты") = "0-0.15"
+    dict("Количество крупных тромбоцитов") = "0-66"
+    dict("Процент крупных тромбоцитов") = "0-25"
+    
+    ' Моча
+    dict("Гиалиновые цилиндры") = "0.00-1.00"
+    dict("Эритроцитарные цилиндры") = "0-0"
+    dict("Лейкоцитарные цилиндры") = "0-0"
+    dict("Цилиндры из клеток канальцев") = "0-0"
+    dict("Зернистые цилиндры") = "0-0"
+    dict("Восковидные цилиндры") = "0-0"
+    dict("Жировые цилиндры") = "0-0"
+    dict("Гемоглобиновые цилиндры") = "0-0"
+    dict("Кристаллы струвита") = "0.00-0.30"
+    dict("Кристаллы оксалата кальция (моногидрат)") = "0-0"
+    dict("Кристаллы оксалата кальция (дигидрат)") = "0.00-0.30"
+    dict("Кристаллы фосфата кальция") = "0-0"
+    dict("Кристаллы мочевой кислоты") = "0-0"
+    dict("Кристаллы цистина") = "0-0"
+    dict("Кристаллы холестерина") = "0-0"
+    dict("Кристаллы билирубина") = "0-0"
+    dict("Кристаллы аммоний биурата") = "0.00-0.30"
+    dict("Эритроциты (моча)") = "0.0-5.00"
+    dict("Лейкоциты (моча)") = "0.0-5.00"
+    dict("Клетки канальцев почек") = "0-0"
+    dict("Плоские эпителиальные клетки") = "0-2.00"
+    dict("Клетки переходного эпителия") = "0-2.00"
+    dict("Сперматозоиды") = "0-0"
+    dict("Жировые капли") = "0-5.00"
+    dict("Слизистые нити") = "0-1.00"
+    
+    ' Паразиты
+    dict("Яйца аскарид") = "0-0"
+    dict("Яйца анкилостомы") = "0-0"
+    dict("Яйца цестод") = "0-0"
+    dict("Яйца дипилидия") = "0-0"
+    dict("Яйца спирометры") = "0-0"
+    dict("Яйца цепня (тип Taenia)") = "0-0"
+    dict("Яйца трематод") = "0-0"
+    dict("Трихомонады") = "0-0"
+    dict("Лямблии") = "0-0"
+    dict("Вариант кокцидий 0") = "0"
+    dict("Вариант кокцидий 1") = "0"
+    dict("Вариант кокцидий 2") = "0"
+    dict("Кокцидии") = "0"
+    dict("Токсоплазма") = "0-0"
+    
+    ' Кал
+    dict("Кокковые бактерии") = "2.00-120.00"
+    dict("Бациллы") = "80.00-2200.00"
+    dict("Соотношение кокков и бацилл") = "0.01-0.15"
+    dict("Кампилобактер") = "0-4.5"
+    dict("Палочковидные бактерии") = "0-6.00"
+    dict("Дрожжи") = "0-20"
+    dict("Брахиспира") = "0"
+    dict("Хеликобактер") = "0"
+    dict("Грибные нити") = "0-0"
+    dict("Эпителиальные клетки") = "0-2"
+    dict("Крахмальные зёрна") = "0-2"
+    dict("Жировые капли") = "0-0.2"
+    dict("Растительные волокна") = "0-0.1"
+    dict("Мышечные волокна") = "0-0.1"
+    
+    ' Биохимия
+    dict("С-реактивный белок у собак") = "0-10"
+End Sub
+
+
+
+
+
+
